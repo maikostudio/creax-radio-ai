@@ -1,0 +1,8 @@
+
+{
+  "name": "CREAX RadioAI Argentina",
+  "description": "Publicidad profesional con acento rioplatense y mezcla de audio automática.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
