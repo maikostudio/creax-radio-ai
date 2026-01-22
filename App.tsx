@@ -4,6 +4,19 @@ import { GoogleGenAI, Modality } from "@google/genai";
 import { VIBES, SYSTEM_PROMPT, VOICES } from './constants';
 import { AdProject, AdScript, InterpretationStyle, AppView, AdminConfig, SavedProduction } from './types';
 
+// Extendemos window para las funciones de AI Studio
+// Fix: Use the standard AIStudio interface for window augmentation to avoid modifier conflicts
+declare global {
+  interface AIStudio {
+    hasSelectedApiKey: () => Promise<boolean>;
+    openSelectKey: () => Promise<void>;
+  }
+
+  interface Window {
+    aistudio: AIStudio;
+  }
+}
+
 // Utilidades de Audio Master
 function decodeBase64(base64: string) {
   try {
@@ -65,12 +78,10 @@ function audioBufferToWav(buffer: AudioBuffer): Blob {
 }
 
 const App: React.FC = () => {
-  // Navigation & Auth
   const [currentView, setCurrentView] = useState<AppView>('studio');
-  const [isAdmin, setIsAdmin] = useState(false);
   const [isPro, setIsPro] = useState(false);
+  const [hasKey, setHasKey] = useState(false);
   
-  // App Logic
   const [step, setStep] = useState(0);
   const [project, setProject] = useState<AdProject>({ category: '', location: '', vibe: 'litoral', briefing: '', type: 'ads', voiceId: 'Kore' });
   const [isGenerating, setIsGenerating] = useState(false);
@@ -78,26 +89,34 @@ const App: React.FC = () => {
   const [audioStatus, setAudioStatus] = useState('');
   const [error, setError] = useState<string | null>(null);
   
-  // Admin & Persistent State
   const [history, setHistory] = useState<SavedProduction[]>([]);
   const [adminConfig, setAdminConfig] = useState<AdminConfig>({
     merchantEmail: 'admin@creax.studio',
     currency: 'USD',
-    stripeKey: 'pk_test_creax_12345',
-    mercadoPagoKey: 'mp_test_987654',
+    stripeKey: '',
+    mercadoPagoKey: '',
     subscriptionPrice: 19.99
   });
 
-  // Recording State
   const [isRecording, setIsRecording] = useState(false);
   const [recordedAudioBase64, setRecordedAudioBase64] = useState<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const currentSourcesRef = useRef<AudioBufferSourceNode[]>([]);
 
   useEffect(() => {
+    const checkKey = async () => {
+      const selected = await window.aistudio.hasSelectedApiKey();
+      setHasKey(selected);
+    };
+    checkKey();
     const saved = localStorage.getItem('creax_history');
     if (saved) setHistory(JSON.parse(saved));
   }, []);
+
+  const handleLinkKey = async () => {
+    await window.aistudio.openSelectKey();
+    setHasKey(true);
+  };
 
   const saveProduction = (scripts: AdScript[]) => {
     const newItems: SavedProduction[] = scripts.map(s => ({
@@ -126,12 +145,14 @@ const App: React.FC = () => {
       };
       recorder.start();
       setIsRecording(true);
-    } catch (e) { setError("Error de Micrófono"); }
+    } catch (e) { setError("No se detectó el micrófono."); }
   };
 
   const generateScripts = async () => {
     setIsGenerating(true);
+    setError(null);
     try {
+      // Siempre crear una nueva instancia para capturar la última API KEY vinculada
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const prompt = SYSTEM_PROMPT
         .replace(/{type}/g, project.type)
@@ -143,13 +164,25 @@ const App: React.FC = () => {
       const contents: any[] = [{ parts: [{ text: prompt }] }];
       if (recordedAudioBase64) contents[0].parts.push({ inlineData: { data: recordedAudioBase64, mimeType: 'audio/webm' } });
 
-      const res = await ai.models.generateContent({ model: "gemini-3-flash-preview", contents, config: { responseMimeType: "application/json" } });
+      const res = await ai.models.generateContent({ 
+        model: "gemini-3-pro-preview", // Usamos Pro para máxima potencia creativa
+        contents, 
+        config: { responseMimeType: "application/json" } 
+      });
+
       const data = JSON.parse(res.text || "{}");
       const scriptsWithId = (data.scripts || []).map((s: any) => ({ ...s, id: Math.random().toString(36).substr(2, 9), createdAt: Date.now() }));
       setResults(scriptsWithId);
       saveProduction(scriptsWithId);
       setStep(3);
-    } catch (e) { setError("Error en Generación"); }
+    } catch (e: any) { 
+      if (e.message?.includes("Requested entity was not found")) {
+        setError("Error de vinculación. Por favor, selecciona tu API Key de nuevo.");
+        setHasKey(false);
+      } else {
+        setError("Error en la conexión con el motor de IA. Reintenta en unos segundos.");
+      }
+    }
     finally { setIsGenerating(false); }
   };
 
@@ -160,7 +193,7 @@ const App: React.FC = () => {
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const tts = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: `Voz: ${style}. Texto: ${script.text}` }] }],
+        contents: [{ parts: [{ text: `Actúa como un locutor de radio. Estilo: ${style}. Texto: ${script.text}` }] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: project.voiceId as any } } }
@@ -180,7 +213,13 @@ const App: React.FC = () => {
       const mSrc = offlineCtx.createBufferSource();
       vSrc.buffer = voiceBuf; mSrc.buffer = musicBuf;
       const vG = offlineCtx.createGain(); const mG = offlineCtx.createGain();
-      mG.gain.setValueAtTime(0.1, 0); mG.gain.exponentialRampToValueAtTime(0.04, 1);
+      
+      // Ducking Master
+      mG.gain.setValueAtTime(0.12, 0); 
+      mG.gain.exponentialRampToValueAtTime(0.05, 0.8);
+      mG.gain.setValueAtTime(0.05, voiceBuf.duration - 0.5);
+      mG.gain.exponentialRampToValueAtTime(0.12, voiceBuf.duration);
+      
       vSrc.connect(vG).connect(offlineCtx.destination);
       mSrc.connect(mG).connect(offlineCtx.destination);
       vSrc.start(0); mSrc.start(0);
@@ -188,9 +227,9 @@ const App: React.FC = () => {
       const blob = audioBufferToWav(rendered);
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
-      link.download = `CREAX_${script.title.replace(/\s/g, '_')}.wav`;
+      link.download = `CREAX_MASTER_${project.category.replace(/\s/g, '_')}.wav`;
       link.click();
-    } catch (e) { setError("Error en Descarga"); }
+    } catch (e) { setError("Error al procesar el audio master."); }
     finally { setAudioStatus(""); }
   };
 
@@ -230,7 +269,12 @@ const App: React.FC = () => {
           </div>
         </nav>
 
-        <div className="pt-10 border-t border-white/5">
+        <div className="pt-10 border-t border-white/5 space-y-3">
+           {!hasKey && (
+             <button onClick={handleLinkKey} className="w-full bg-red-500/10 text-red-500 border border-red-500/20 p-4 rounded-2xl text-[10px] font-black uppercase hover:bg-red-500/20 transition-all">
+                <i className="fas fa-key mr-2"></i> Vincular API Key
+             </button>
+           )}
            <div className={`p-5 rounded-3xl border ${isPro ? 'bg-amber-500/10 border-amber-500/30' : 'bg-slate-800/40 border-slate-700'}`}>
               <p className="text-[10px] font-black uppercase tracking-widest mb-2 flex items-center gap-2">
                 <i className={`fas ${isPro ? 'fa-crown text-amber-500' : 'fa-user text-slate-500'}`}></i> 
@@ -246,6 +290,16 @@ const App: React.FC = () => {
         
         {currentView === 'studio' && (
           <div className="p-12 max-w-6xl mx-auto">
+            {!hasKey && (
+              <div className="mb-12 bg-amber-500/10 border border-amber-500/20 p-8 rounded-[2rem] flex items-center justify-between">
+                <div>
+                   <h3 className="font-black text-amber-500 uppercase italic">Motor de IA Desconectado</h3>
+                   <p className="text-slate-400 text-sm">Debes vincular tu cuenta de Google AI Studio para usar los modelos Pro.</p>
+                </div>
+                <button onClick={handleLinkKey} className="bg-amber-500 text-slate-950 px-8 py-4 rounded-2xl font-black text-xs uppercase tracking-widest hover:scale-105 transition-all">Vincular Ahora</button>
+              </div>
+            )}
+
             {step === 0 && (
               <div className="max-w-3xl mx-auto py-12 animate-in fade-in zoom-in-95 duration-500">
                 <h2 className="text-5xl font-black mb-4 italic tracking-tighter">Inicia una <span className="text-emerald-400">Sesión.</span></h2>
@@ -267,7 +321,13 @@ const App: React.FC = () => {
                       />
                     </div>
                   </div>
-                  <button onClick={() => setStep(1)} disabled={!project.category} className="w-full bg-emerald-500 text-slate-950 font-black py-8 rounded-[2rem] text-xl uppercase tracking-widest shadow-2xl shadow-emerald-500/20 hover:scale-[1.02] transition-all">Configurar Estilos</button>
+                  <button 
+                    onClick={() => setStep(1)} 
+                    disabled={!project.category || !hasKey} 
+                    className="w-full bg-emerald-500 text-slate-950 font-black py-8 rounded-[2rem] text-xl uppercase tracking-widest shadow-2xl shadow-emerald-500/20 hover:scale-[1.02] transition-all disabled:opacity-30"
+                  >
+                    Configurar Estilos
+                  </button>
                 </div>
               </div>
             )}
@@ -334,7 +394,7 @@ const App: React.FC = () => {
                      <div className="flex gap-8 mt-12">
                         <button onClick={() => setStep(1)} className="flex-1 bg-slate-900 py-8 rounded-[2rem] font-black text-slate-500 hover:text-white transition-all uppercase text-sm tracking-widest">Casting</button>
                         <button 
-                          onClick={generateScripts} disabled={isGenerating}
+                          onClick={generateScripts} disabled={isGenerating || !hasKey}
                           className="flex-[2] bg-gradient-to-r from-emerald-500 to-cyan-500 text-slate-950 font-black py-8 rounded-[2rem] text-xl uppercase tracking-widest shadow-2xl disabled:opacity-30"
                         >
                           {isGenerating ? <i className="fas fa-compact-disc animate-spin"></i> : "Generar Producción"}
@@ -351,7 +411,7 @@ const App: React.FC = () => {
                      <button onClick={() => setStep(0)} className="bg-emerald-500 text-slate-950 px-10 py-5 rounded-2xl font-black text-xs uppercase tracking-widest">Nueva Sesión</button>
                   </div>
                   <div className="grid gap-12">
-                    {results.map((s, i) => (
+                    {results.map((s) => (
                       <div key={s.id} className="bg-slate-900/60 p-16 rounded-[4.5rem] border border-white/5 relative overflow-hidden group">
                          <div className="flex flex-col lg:flex-row gap-16 relative z-10">
                             <div className="flex-1">
@@ -408,10 +468,6 @@ const App: React.FC = () => {
                       <p className="text-[10px] font-black uppercase text-slate-500 mb-2">Total Producciones</p>
                       <span className="text-4xl font-black">{history.length}</span>
                    </div>
-                   <div className="bg-emerald-500 p-8 rounded-[2rem] text-slate-950 text-center min-w-[200px]">
-                      <p className="text-[10px] font-black uppercase text-slate-950/60 mb-2">Ingresos Estimados</p>
-                      <span className="text-4xl font-black">${(history.length * 0.5).toFixed(2)}</span>
-                   </div>
                 </div>
              </div>
 
@@ -467,22 +523,6 @@ const App: React.FC = () => {
                             type="email" className="w-full bg-slate-950 border-2 border-slate-800 p-6 rounded-2xl focus:border-emerald-500 outline-none"
                             value={adminConfig.merchantEmail} onChange={e => setAdminConfig({...adminConfig, merchantEmail: e.target.value})}
                           />
-                       </div>
-                       <div className="grid grid-cols-2 gap-6">
-                          <div className="space-y-3">
-                            <label className="text-[10px] font-black uppercase text-slate-600 ml-4">Stripe Public Key</label>
-                            <input 
-                              type="text" className="w-full bg-slate-950 border-2 border-slate-800 p-6 rounded-2xl focus:border-emerald-500 outline-none"
-                              value={adminConfig.stripeKey} onChange={e => setAdminConfig({...adminConfig, stripeKey: e.target.value})}
-                            />
-                          </div>
-                          <div className="space-y-3">
-                            <label className="text-[10px] font-black uppercase text-slate-600 ml-4">MercadoPago Access Token</label>
-                            <input 
-                              type="text" className="w-full bg-slate-950 border-2 border-slate-800 p-6 rounded-2xl focus:border-emerald-500 outline-none"
-                              value={adminConfig.mercadoPagoKey} onChange={e => setAdminConfig({...adminConfig, mercadoPagoKey: e.target.value})}
-                            />
-                          </div>
                        </div>
                     </div>
                  </div>
