@@ -1,32 +1,45 @@
 
-import { Vibe } from './types';
+import { Vibe, VoiceProfile } from './types';
 
-export const SYSTEM_PROMPT = `Actúa como un Director Creativo Federal de Radio con gran trayectoria en el NEA y el Litoral Argentino. 
-Tu misión es escribir 3 guiones de radio de 20-30 segundos para un cliente local.
+export const SYSTEM_PROMPT = `Actúa como un Productor Senior de Audio y Director Creativo. 
+Tu tarea es generar 3 propuestas de guion de nivel profesional para el formato: {type}.
 
-REGLAS DE IDENTIDAD FEDERAL (NEA):
-1. TONALIDAD: Usá un español argentino federal. Debe ser cálido, cercano y profesional. 
-2. EVITAR SESGOS: No uses modismos porteños exagerados (evitá "canchero", "palermitano", "viste"). 
-3. ACENTO REGIONAL: El tono debe sugerir la calidez de las provincias del Litoral (Misiones, Corrientes, Chaco, Formosa, Entre Ríos). 
-4. LENGUAJE: Usá un voseo respetuoso y natural ("vení", "encontrá", "disfrutá") pero con una estructura que resulte clara en todo el país.
-5. FORMATO: Incluí instrucciones de locución entre corchetes [Ej: Locutor con tono pausado y cordial].
+DIRECTRICES DE CALIDAD:
+- IMPACTO: Los primeros 3 segundos deben captar la atención.
+- EMOCIÓN: Usar un lenguaje que conecte con la sensibilidad de {location}.
+- PROSODIA: Escribir pensando en el ritmo respiratorio de un locutor real.
+- FORMATO: Evitar clichés. Si es Podcast, busca profundidad. Si es ID de Radio, busca potencia sonora.
 
 DATOS DEL PROYECTO:
+Tipo: {type}
 Rubro: {category}
 Ubicación: {location}
-Idea base: {briefing}
-Onda: {vibe}
+Instrucciones: {briefing}
+Estilo de Música: {vibe}
 
-Devolvé EXCLUSIVAMENTE un objeto JSON:
+Devolvé un JSON con este formato:
 {
   "scripts": [
-    { "title": "Nombre", "text": "Texto del guion...", "sfx": "Descripción de sonidos", "tone": "Descripción del tono regional" }
+    { 
+      "title": "Nombre", 
+      "text": "Texto para leer (máximo 40 segundos)", 
+      "sfx": "FX de sonido sugeridos", 
+      "tone": "Instrucciones de emoción (ej: Cálido, Vendedor, Urgente)",
+      "energy": "high" 
+    }
   ]
 }`;
 
 export const VIBES: Vibe[] = [
-  { id: 'litoral', name: 'Calidez / Litoral', icon: 'fa-water', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-acoustic-guitar-chill-out-120.mp3', color: 'bg-emerald-600' },
-  { id: 'retail', name: 'Gran Promo', icon: 'fa-tag', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-tech-house-vibes-130.mp3', color: 'bg-orange-500' },
-  { id: 'epic', name: 'Institucional', icon: 'fa-landmark', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-climbing-the-mountain-120.mp3', color: 'bg-blue-800' },
-  { id: 'chill', name: 'Tranquilo / Mate', icon: 'fa-mug-hot', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-soft-ambient-120.mp3', color: 'bg-teal-500' }
+  { id: 'litoral', name: 'Folclore / Calidez', icon: 'fa-guitar', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-acoustic-guitar-chill-out-120.mp3', color: 'bg-emerald-700' },
+  { id: 'urban', name: 'Urbano / Moderno', icon: 'fa-city', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-tech-house-vibes-130.mp3', color: 'bg-indigo-600' },
+  { id: 'epic', name: 'Épico / Cine', icon: 'fa-film', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-climbing-the-mountain-120.mp3', color: 'bg-red-700' },
+  { id: 'news', name: 'Informativo', icon: 'fa-broadcast-tower', musicUrl: 'https://assets.mixkit.co/music/preview/mixkit-global-reporting-120.mp3', color: 'bg-slate-800' }
+];
+
+export const VOICES: VoiceProfile[] = [
+  { id: 'Kore', name: 'Kore (Institucional)', gender: 'M', description: 'Voz madura, confiable y profunda.' },
+  { id: 'Puck', name: 'Puck (Juvenil)', gender: 'F', description: 'Enérgica, brillante y cercana.' },
+  { id: 'Charon', name: 'Charon (Relator)', gender: 'M', description: 'Narrativo, pausado, ideal para cuentos.' },
+  { id: 'Fenrir', name: 'Fenrir (Potente)', gender: 'M', description: 'Bajos profundos, ideal para IDs de radio.' }
 ];

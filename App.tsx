@@ -1,484 +1,326 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { VIBES, SYSTEM_PROMPT } from './constants';
-import { AdProject, AdScript } from './types';
+import { VIBES, SYSTEM_PROMPT, VOICES } from './constants';
+import { AdProject, AdScript, ProductionType } from './types';
 
-// Utilidad para decodificar base64 manualmente
+// Utilidades de Audio
 function decodeBase64(base64: string) {
   try {
-    const binaryString = atob(base64);
+    const binaryString = atob(base64.replace(/\s/g, ''));
     const bytes = new Uint8Array(binaryString.length);
     for (let i = 0; i < binaryString.length; i++) {
       bytes[i] = binaryString.charCodeAt(i);
     }
     return bytes;
   } catch (e) {
-    console.error("Error decodificando Base64:", e);
+    console.error("Base64 Error", e);
     return new Uint8Array(0);
   }
 }
 
-// Decodificador de PCM raw 16-bit para TTS de Gemini (24000Hz)
 async function decodeRawPcm(data: Uint8Array, ctx: AudioContext): Promise<AudioBuffer | null> {
-  if (!data || data.length === 0) return null;
-  try {
-    const bufferView = new DataView(data.buffer, data.byteOffset, data.byteLength);
-    const l = data.byteLength / 2;
-    const audioBuffer = ctx.createBuffer(1, l, 24000);
-    const channelData = audioBuffer.getChannelData(0);
-    for (let i = 0; i < l; i++) {
-      channelData[i] = bufferView.getInt16(i * 2, true) / 32768.0;
-    }
-    return audioBuffer;
-  } catch (e) {
-    console.error("Error al procesar el buffer PCM:", e);
-    return null;
+  if (!data.length) return null;
+  const bufferView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const l = data.byteLength / 2;
+  const audioBuffer = ctx.createBuffer(1, l, 24000);
+  const channelData = audioBuffer.getChannelData(0);
+  for (let i = 0; i < l; i++) {
+    channelData[i] = bufferView.getInt16(i * 2, true) / 32768.0;
   }
+  return audioBuffer;
 }
-
-const Card: React.FC<{ children: React.ReactNode; className?: string }> = ({ children, className }) => (
-  <div className={`bg-white/90 backdrop-blur-2xl p-8 md:p-14 rounded-[4rem] shadow-[0_40px_80px_-15px_rgba(0,0,0,0.08)] border border-white/50 ${className}`}>
-    {children}
-  </div>
-);
-
-// Almacén de música pre-cargada
-const musicCache: Record<string, AudioBuffer | null> = {};
 
 const App: React.FC = () => {
   const [step, setStep] = useState(0);
-  const [project, setProject] = useState<AdProject>({ category: '', location: '', vibe: 'litoral', briefing: '' });
+  const [project, setProject] = useState<AdProject>({ 
+    category: '', location: '', vibe: 'litoral', briefing: '', type: 'ads', voiceId: 'Kore' 
+  });
   const [isGenerating, setIsGenerating] = useState(false);
-  const [loadingMessageIndex, setLoadingMessageIndex] = useState(0);
   const [results, setResults] = useState<AdScript[]>([]);
   const [playingIndex, setPlayingIndex] = useState<number | null>(null);
-  const [isGeneratingAudio, setIsGeneratingAudio] = useState(false);
+  const [audioStatus, setAudioStatus] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
-  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
-  
-  const [isRecording, setIsRecording] = useState(false);
-  const [audioBase64, setAudioBase64] = useState<string | null>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const currentSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-
-  const loadingMessages = [
-    "Sintonizando la frecuencia...",
-    "Buscando la calidez del Litoral...",
-    "Ajustando el tono regional...",
-    "Mezclando con sonidos de nuestra tierra...",
-    "Casi listo, aguardanos..."
-  ];
-
-  useEffect(() => {
-    let interval: any;
-    if (isGenerating) {
-      interval = setInterval(() => {
-        setLoadingMessageIndex((prev) => (prev + 1) % loadingMessages.length);
-      }, 3000);
-    }
-    return () => clearInterval(interval);
-  }, [isGenerating]);
-
-  // Pre-cargar música del ambiente seleccionado
-  useEffect(() => {
-    const preloadMusic = async () => {
-      const vibe = VIBES.find(v => v.id === project.vibe);
-      if (vibe && musicCache[vibe.id] === undefined) {
-        try {
-          if (!audioContextRef.current) audioContextRef.current = new AudioContext();
-          const res = await fetch(vibe.musicUrl);
-          if (!res.ok) throw new Error("Fallo descarga música");
-          const arrayBuf = await res.arrayBuffer();
-          const audioBuf = await audioContextRef.current.decodeAudioData(arrayBuf);
-          musicCache[vibe.id] = audioBuf;
-        } catch (e) { 
-          console.warn("No se pudo pre-cargar música de fondo:", vibe.name);
-          musicCache[vibe.id] = null; 
-        }
-      }
-    };
-    preloadMusic();
-  }, [project.vibe]);
-
-  const startRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      chunksRef.current = [];
-      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mediaRecorder.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-        const reader = new FileReader();
-        reader.readAsDataURL(blob);
-        reader.onloadend = () => {
-          const base64data = (reader.result as string).split(',')[1];
-          setAudioBase64(base64data);
-        };
-        stream.getTracks().forEach(track => track.stop());
-      };
-      mediaRecorder.start();
-      setIsRecording(true);
-    } catch (err) {
-      setError("No se pudo acceder al micrófono. Verificá los permisos.");
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
-    }
-  };
 
   const generateScripts = async () => {
-    const apiKey = process.env.API_KEY;
-    if (!apiKey) {
-      setError("Error de configuración: API_KEY no encontrada.");
-      return;
-    }
-
     setIsGenerating(true);
     setError(null);
-    
     try {
-      const ai = new GoogleGenAI({ apiKey });
-      const finalPrompt = SYSTEM_PROMPT
-        .replace('{category}', project.category)
-        .replace('{location}', project.location)
-        .replace('{briefing}', project.briefing || "Generar propuesta creativa federal.")
-        .replace('{vibe}', project.vibe);
-
-      const parts: any[] = [{ text: finalPrompt }];
-      if (audioBase64) parts.push({ inlineData: { data: audioBase64, mimeType: 'audio/webm' } });
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const prompt = SYSTEM_PROMPT
+        .replace(/{type}/g, project.type)
+        .replace(/{category}/g, project.category)
+        .replace(/{location}/g, project.location)
+        .replace(/{briefing}/g, project.briefing)
+        .replace(/{vibe}/g, project.vibe);
 
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: { parts },
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              scripts: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    title: { type: Type.STRING },
-                    text: { type: Type.STRING },
-                    sfx: { type: Type.STRING },
-                    tone: { type: Type.STRING }
-                  },
-                  required: ["title", "text", "sfx", "tone"]
-                }
-              }
-            }
-          }
-        }
+        contents: [{ parts: [{ text: prompt }] }],
+        config: { responseMimeType: "application/json" }
       });
 
-      const parsed = JSON.parse(response.text || "{}");
-      if (parsed.scripts && parsed.scripts.length > 0) {
-        setResults(parsed.scripts);
-        setStep(3);
-      } else {
-        throw new Error("Respuesta vacía de la IA.");
-      }
-    } catch (err) {
-      console.error(err);
-      setError("La IA está demorando más de lo usual. Intentá con un texto más breve.");
+      const data = JSON.parse(response.text || "{}");
+      setResults(data.scripts || []);
+      setStep(3);
+    } catch (e) {
+      setError("Error en la conexión con el estudio.");
     } finally {
       setIsGenerating(false);
     }
   };
 
-  const stopAllAudio = () => {
-    currentSourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
-    currentSourcesRef.current = [];
-    setPlayingIndex(null);
-    setIsGeneratingAudio(false);
-  };
-
-  const playDemo = async (index: number, shouldDownload = false) => {
-    if (playingIndex === index && !shouldDownload) {
-      stopAllAudio();
+  const playStudioProduction = async (index: number) => {
+    if (playingIndex === index) {
+      stopAudio();
       return;
     }
-
-    stopAllAudio();
-    setIsGeneratingAudio(true);
+    stopAudio();
     setPlayingIndex(index);
-
-    const apiKey = process.env.API_KEY;
-    if (!apiKey) return;
+    setAudioStatus('Procesando Mix...');
 
     try {
       const script = results[index];
-      const vibeData = VIBES.find(v => v.id === project.vibe);
-      const ai = new GoogleGenAI({ apiKey });
+      const vibe = VIBES.find(v => v.id === project.vibe);
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-      const ttsResponse = await ai.models.generateContent({
+      // TTS Profesional
+      const tts = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: `Locutor con tono ${script.tone}. Leé este guion de radio: ${script.text}` }] }],
+        contents: [{ parts: [{ text: `Actúa como un locutor profesional. Tono: ${script.tone}. Guion: ${script.text}` }] }],
         config: {
           responseModalities: [Modality.AUDIO],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: project.voiceId as any } } }
         }
       });
 
-      const voiceBase64 = ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (!voiceBase64) throw new Error("No se pudo generar la voz.");
+      const voiceData = tts.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!voiceData) throw new Error("Voz fallida");
 
       if (!audioContextRef.current) audioContextRef.current = new AudioContext();
       const ctx = audioContextRef.current;
-      if (ctx.state === 'suspended') await ctx.resume();
+      await ctx.resume();
 
-      // Carga resiliente de música
-      let musicBuffer = musicCache[project.vibe];
-      if (!musicBuffer) {
-        try {
-          const musicRes = await fetch(vibeData?.musicUrl || '');
-          if (musicRes.ok) {
-            musicBuffer = await ctx.decodeAudioData(await musicRes.arrayBuffer());
-            musicCache[project.vibe] = musicBuffer;
-          }
-        } catch (e) {
-          console.warn("Fallo carga música, se usará solo voz.");
-          musicCache[project.vibe] = null;
-        }
-      }
+      const voiceBuf = await decodeRawPcm(decodeBase64(voiceData), ctx);
+      const musicRes = await fetch(vibe?.musicUrl || '');
+      const musicBuf = await ctx.decodeAudioData(await musicRes.arrayBuffer());
 
-      const voiceBuffer = await decodeRawPcm(decodeBase64(voiceBase64), ctx);
-      if (!voiceBuffer) throw new Error("Error procesando audio de voz.");
+      if (!voiceBuf) return;
 
+      // Master Nodes
       const voiceSource = ctx.createBufferSource();
-      voiceSource.buffer = voiceBuffer;
-      
-      const musicSource = musicBuffer ? ctx.createBufferSource() : null;
-      if (musicSource) {
-        musicSource.buffer = musicBuffer!;
-        musicSource.loop = true;
-      }
-
-      const musicGain = ctx.createGain();
+      const musicSource = ctx.createBufferSource();
       const voiceGain = ctx.createGain();
-      const masterGain = ctx.createGain();
+      const musicGain = ctx.createGain();
 
+      voiceSource.buffer = voiceBuf;
+      musicSource.buffer = musicBuf;
+      musicSource.loop = true;
+
+      // DINÁMICA DE ESTUDIO (Ducking)
       musicGain.gain.setValueAtTime(0.2, ctx.currentTime);
-      if (musicSource) musicGain.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 1.2);
-      voiceGain.gain.setValueAtTime(1.0, ctx.currentTime);
+      // Bajamos música cuando empieza la voz
+      musicGain.gain.exponentialRampToValueAtTime(0.05, ctx.currentTime + 1);
+      voiceGain.gain.setValueAtTime(1.2, ctx.currentTime);
 
-      if (shouldDownload) {
-        const dest = ctx.createMediaStreamDestination();
-        masterGain.connect(dest);
-        const mediaRecorder = new MediaRecorder(dest.stream);
-        const chunks: Blob[] = [];
-        mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
-        mediaRecorder.onstop = () => {
-          const blob = new Blob(chunks, { type: 'audio/webm' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `SPOT-RADIO-${script.title.replace(/\s+/g, '-')}.webm`;
-          a.click();
-        };
-        mediaRecorder.start();
-        recorderRef.current = mediaRecorder;
-      }
+      voiceSource.connect(voiceGain).connect(ctx.destination);
+      musicSource.connect(musicGain).connect(ctx.destination);
 
-      voiceSource.connect(voiceGain).connect(masterGain).connect(ctx.destination);
-      if (musicSource) musicSource.connect(musicGain).connect(masterGain).connect(ctx.destination);
-
-      setIsGeneratingAudio(false);
       voiceSource.start();
-      if (musicSource) musicSource.start();
-      currentSourcesRef.current = musicSource ? [voiceSource, musicSource] : [voiceSource];
-      
+      musicSource.start();
+      currentSourcesRef.current = [voiceSource, musicSource];
+
       voiceSource.onended = () => {
-        if (musicSource) musicGain.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 1);
-        setTimeout(() => {
-          if (recorderRef.current && recorderRef.current.state === 'recording') recorderRef.current.stop();
-          stopAllAudio();
-        }, 2000);
+        musicGain.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 1.5);
+        setTimeout(stopAudio, 2500);
       };
 
+      setAudioStatus('');
     } catch (e) {
-      console.error(e);
-      setError("Error al procesar el audio. Intentá reproducir de nuevo.");
-      stopAllAudio();
+      setError("Error en el renderizado de audio.");
+      stopAudio();
     }
   };
 
-  const copyToClipboard = (text: string, index: number) => {
-    navigator.clipboard.writeText(text);
-    setCopiedIndex(index);
-    setTimeout(() => setCopiedIndex(null), 2000);
+  const stopAudio = () => {
+    currentSourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
+    currentSourcesRef.current = [];
+    setPlayingIndex(null);
+    setAudioStatus('');
   };
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans selection:bg-emerald-100">
-      <nav className="p-8 max-w-7xl mx-auto flex justify-between items-center">
-        <div className="flex items-center gap-4 group cursor-pointer" onClick={() => setStep(0)}>
-          <div className="w-14 h-14 bg-gradient-to-tr from-emerald-700 to-blue-600 rounded-2xl flex items-center justify-center text-white shadow-xl shadow-blue-200 group-hover:rotate-6 transition-transform">
-            <i className="fas fa-radio text-2xl"></i>
+    <div className="min-h-screen bg-[#0F172A] text-slate-100 font-sans p-6">
+      {/* HEADER ESTILO ESTUDIO */}
+      <header className="max-w-6xl mx-auto flex justify-between items-center mb-12 bg-slate-800/50 p-6 rounded-3xl border border-slate-700 shadow-2xl">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 bg-emerald-500 rounded-xl flex items-center justify-center shadow-lg shadow-emerald-500/20">
+            <i className="fas fa-sliders text-xl text-slate-900"></i>
           </div>
-          <h1 className="text-3xl font-black italic tracking-tighter uppercase">CREAX <span className="text-emerald-600">IA</span></h1>
+          <h1 className="text-2xl font-black tracking-tighter uppercase italic">
+            CREAX <span className="text-emerald-500">PRO STUDIO</span>
+          </h1>
         </div>
-        <div className="flex items-center gap-2 bg-white px-5 py-2.5 rounded-full text-[10px] font-black uppercase border border-slate-200 shadow-sm text-slate-400">
-          <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
-          Estudio Federal v4.1
-        </div>
-      </nav>
-
-      <main className="max-w-4xl mx-auto px-6 py-10">
-        {error && (
-          <Card className="mb-8 !p-8 border-red-100 bg-red-50/50 animate-in slide-in-from-top-4">
-            <div className="flex items-center gap-4 text-red-700">
-              <i className="fas fa-circle-exclamation text-3xl"></i>
-              <div className="flex-1">
-                <p className="font-black text-xl leading-tight">Estado del Sistema</p>
-                <p className="font-medium opacity-80 text-sm mt-1">{error}</p>
-              </div>
-              <button onClick={() => setError(null)} className="text-red-400 hover:text-red-600"><i className="fas fa-times"></i></button>
-            </div>
-          </Card>
-        )}
-
-        {step === 0 && (
-          <Card className="animate-in fade-in slide-in-from-bottom-10 duration-1000">
-            <div className="mb-12 text-center">
-              <h2 className="text-6xl font-black mb-6 leading-[1.1] tracking-tight">Publicidad <br/><span className="text-emerald-600">Federal y Nuestra</span></h2>
-              <p className="text-slate-400 font-medium text-xl">Potenciá tu marca con el tono del Litoral.</p>
-            </div>
-            <div className="grid md:grid-cols-2 gap-8 mb-8">
-              <input 
-                type="text" placeholder="¿Qué vendemos?"
-                className="w-full p-6 bg-slate-50 border-2 border-transparent focus:border-emerald-600 focus:bg-white rounded-3xl outline-none transition-all text-lg font-bold shadow-sm"
-                value={project.category} onChange={e => setProject({...project, category: e.target.value})}
-              />
-              <input 
-                type="text" placeholder="¿En qué ciudad?"
-                className="w-full p-6 bg-slate-50 border-2 border-transparent focus:border-emerald-600 focus:bg-white rounded-3xl outline-none transition-all text-lg font-bold shadow-sm"
-                value={project.location} onChange={e => setProject({...project, location: e.target.value})}
-              />
-            </div>
+        <div className="flex gap-4">
+          {['ads', 'radio_id', 'podcast'].map(t => (
             <button 
-              onClick={() => setStep(1)} disabled={!project.category || !project.location}
-              className="w-full bg-emerald-600 text-white font-black py-8 rounded-[2.5rem] shadow-xl hover:-translate-y-1 transition-all text-2xl disabled:opacity-50"
+              key={t} onClick={() => setProject({...project, type: t as any})}
+              className={`px-4 py-2 rounded-full text-[10px] font-black uppercase tracking-widest transition-all ${project.type === t ? 'bg-emerald-500 text-slate-900' : 'bg-slate-700 text-slate-400'}`}
             >
-              Configurar Estilo <i className="fas fa-arrow-right ml-2 text-sm"></i>
+              {t.replace('_', ' ')}
             </button>
-          </Card>
+          ))}
+        </div>
+      </header>
+
+      <main className="max-w-5xl mx-auto">
+        {step === 0 && (
+          <div className="grid md:grid-cols-2 gap-10 animate-in fade-in slide-in-from-bottom-10">
+            <div className="bg-slate-800/30 p-10 rounded-[3rem] border border-slate-700 shadow-inner">
+              <h2 className="text-4xl font-black mb-8">Nueva <span className="text-emerald-500">Producción</span></h2>
+              <div className="space-y-6">
+                <div>
+                  <label className="text-[10px] uppercase font-black text-slate-500 mb-2 block ml-2">Cliente / Rubro</label>
+                  <input 
+                    type="text" className="w-full bg-slate-900 border-2 border-slate-700 p-5 rounded-2xl focus:border-emerald-500 outline-none transition-all"
+                    placeholder="Ej: Automotora San Juan" value={project.category} onChange={e => setProject({...project, category: e.target.value})}
+                  />
+                </div>
+                <div>
+                  <label className="text-[10px] uppercase font-black text-slate-500 mb-2 block ml-2">Mercado / Ciudad</label>
+                  <input 
+                    type="text" className="w-full bg-slate-900 border-2 border-slate-700 p-5 rounded-2xl focus:border-emerald-500 outline-none transition-all"
+                    placeholder="Ej: Corrientes Capital" value={project.location} onChange={e => setProject({...project, location: e.target.value})}
+                  />
+                </div>
+                <button 
+                  onClick={() => setStep(1)} disabled={!project.category || !project.location}
+                  className="w-full bg-emerald-500 text-slate-900 font-black py-6 rounded-2xl shadow-xl hover:scale-[1.02] active:scale-95 transition-all text-lg"
+                >
+                  Configurar Sonido <i className="fas fa-chevron-right ml-2"></i>
+                </button>
+              </div>
+            </div>
+            <div className="hidden md:flex flex-col justify-center text-slate-500 space-y-6 border-l border-slate-800 pl-10">
+              <div className="flex items-center gap-4">
+                <i className="fas fa-check-circle text-emerald-500"></i>
+                <p>Mastering automático con Ducking inteligente.</p>
+              </div>
+              <div className="flex items-center gap-4">
+                <i className="fas fa-check-circle text-emerald-500"></i>
+                <p>Escritura creativa optimizada para locución humana.</p>
+              </div>
+              <div className="flex items-center gap-4">
+                <i className="fas fa-check-circle text-emerald-500"></i>
+                <p>Procesamiento de audio en la nube (Vertex Ready).</p>
+              </div>
+            </div>
+          </div>
         )}
 
         {step === 1 && (
-          <Card className="animate-in zoom-in-95 duration-500">
-            <h2 className="text-4xl font-black mb-12 text-center italic tracking-tight">Elegí la <span className="text-emerald-600">Impronta</span></h2>
-            <div className="grid grid-cols-2 gap-6 mb-12">
-              {VIBES.map(v => (
-                <button
-                  key={v.id} onClick={() => setProject({...project, vibe: v.id})}
-                  className={`p-10 rounded-[3rem] border-4 transition-all flex flex-col items-center gap-4 group ${project.vibe === v.id ? 'border-emerald-600 bg-emerald-50/50 scale-105' : 'border-transparent bg-slate-100/50 hover:bg-white shadow-emerald-100 hover:shadow-2xl'}`}
-                >
-                  <div className={`w-20 h-20 rounded-[2rem] ${v.color} text-white flex items-center justify-center text-4xl shadow-2xl`}>
-                    <i className={`fas ${v.icon}`}></i>
-                  </div>
-                  <span className="font-black text-slate-800 text-lg uppercase tracking-wider">{v.name}</span>
-                </button>
-              ))}
+          <div className="animate-in zoom-in-95">
+            <h2 className="text-3xl font-black mb-10 text-center uppercase tracking-widest italic text-emerald-500">Selección de Voces y Clima</h2>
+            <div className="grid md:grid-cols-2 gap-10">
+              <div className="space-y-4">
+                <p className="font-black text-[10px] uppercase text-slate-500 ml-4 mb-4">Perfiles de Locución</p>
+                {VOICES.map(v => (
+                  <button 
+                    key={v.id} onClick={() => setProject({...project, voiceId: v.id})}
+                    className={`w-full p-6 rounded-2xl border-2 flex items-center justify-between transition-all ${project.voiceId === v.id ? 'border-emerald-500 bg-emerald-500/10 shadow-lg shadow-emerald-500/10' : 'border-slate-800 bg-slate-800/50 hover:bg-slate-800'}`}
+                  >
+                    <div className="text-left">
+                      <span className="font-black block text-lg">{v.name}</span>
+                      <span className="text-[10px] text-slate-400">{v.description}</span>
+                    </div>
+                    <i className={`fas ${v.gender === 'M' ? 'fa-mars' : 'fa-venus'} ${project.voiceId === v.id ? 'text-emerald-500' : 'text-slate-600'}`}></i>
+                  </button>
+                ))}
+              </div>
+              <div className="space-y-4">
+                 <p className="font-black text-[10px] uppercase text-slate-500 ml-4 mb-4">Background / Clima</p>
+                 <div className="grid grid-cols-2 gap-4">
+                    {VIBES.map(v => (
+                      <button 
+                        key={v.id} onClick={() => setProject({...project, vibe: v.id})}
+                        className={`p-6 rounded-2xl flex flex-col items-center gap-3 transition-all ${project.vibe === v.id ? 'bg-emerald-500 text-slate-900 shadow-xl' : 'bg-slate-800 hover:bg-slate-700'}`}
+                      >
+                        <i className={`fas ${v.icon} text-2xl`}></i>
+                        <span className="font-black text-[10px] uppercase">{v.name}</span>
+                      </button>
+                    ))}
+                 </div>
+                 <button onClick={() => setStep(2)} className="w-full mt-10 bg-slate-100 text-slate-900 font-black py-6 rounded-2xl shadow-xl hover:bg-white transition-all text-lg">
+                    Cargar Briefing <i className="fas fa-microphone ml-2"></i>
+                 </button>
+              </div>
             </div>
-            <div className="flex gap-6">
-               <button onClick={() => setStep(0)} className="flex-1 bg-slate-200 text-slate-600 font-black py-7 rounded-[2rem] text-xl">Volver</button>
-               <button onClick={() => setStep(2)} className="flex-[2] bg-emerald-600 text-white font-black py-7 rounded-[2rem] text-xl shadow-xl">Siguiente</button>
-            </div>
-          </Card>
+          </div>
         )}
 
         {step === 2 && (
-          <Card>
-            <h2 className="text-4xl font-black mb-8 text-center">Contanos tu <span className="text-emerald-600">Propuesta</span></h2>
-            <div className="grid md:grid-cols-2 gap-8 mb-10">
-              <textarea 
-                rows={6} placeholder="Detalles de la oferta o promo..."
-                className="w-full p-8 bg-slate-100/50 border-4 border-transparent focus:border-emerald-600 focus:bg-white rounded-[2.5rem] outline-none transition-all text-xl font-bold shadow-inner"
-                value={project.briefing} onChange={e => setProject({...project, briefing: e.target.value})}
-              />
-              <div className="flex-1 bg-slate-50 border-4 border-dashed border-slate-200 rounded-[2.5rem] flex flex-col items-center justify-center p-8">
-                {audioBase64 ? (
-                  <div className="text-center animate-in zoom-in-50">
-                    <div className="w-20 h-20 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center text-3xl mx-auto mb-4"><i className="fas fa-check"></i></div>
-                    <span className="font-black text-emerald-800 text-[10px] uppercase tracking-widest">Audio cargado</span>
-                    <button onClick={() => setAudioBase64(null)} className="block mt-2 text-red-500 font-black text-[10px] uppercase">Eliminar</button>
-                  </div>
-                ) : (
-                  <button 
-                    onClick={isRecording ? stopRecording : startRecording}
-                    className={`w-28 h-28 rounded-full flex items-center justify-center text-4xl shadow-2xl transition-all ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-emerald-600 text-white hover:scale-110'}`}
-                  >
-                    <i className={`fas ${isRecording ? 'fa-stop' : 'fa-microphone'}`}></i>
-                  </button>
-                )}
-                {!audioBase64 && !isRecording && <span className="mt-4 font-black text-slate-400 text-[10px] uppercase tracking-widest">Grabar Idea</span>}
-              </div>
-            </div>
-            <button 
-              onClick={generateScripts} disabled={isGenerating || (!project.briefing && !audioBase64)}
-              className={`w-full text-white font-black py-9 rounded-[3rem] text-3xl flex items-center justify-center gap-6 shadow-2xl transition-all ${isGenerating ? 'bg-slate-800' : 'bg-gradient-to-r from-emerald-600 to-blue-700 hover:brightness-110'}`}
-            >
-              {isGenerating ? <span>{loadingMessages[loadingMessageIndex]}</span> : "Generar Campaña"}
-            </button>
-          </Card>
+          <div className="max-w-3xl mx-auto animate-in fade-in">
+             <h2 className="text-3xl font-black mb-8 text-center uppercase tracking-widest text-emerald-500 italic">Briefing de Producción</h2>
+             <textarea 
+               rows={8} className="w-full bg-slate-800 border-2 border-slate-700 p-8 rounded-[2rem] focus:border-emerald-500 outline-none transition-all text-xl font-medium shadow-2xl mb-8"
+               placeholder="Escribí los puntos clave, ofertas o la historia que querés contar..."
+               value={project.briefing} onChange={e => setProject({...project, briefing: e.target.value})}
+             />
+             <div className="flex gap-4">
+               <button onClick={() => setStep(1)} className="flex-1 bg-slate-800 py-6 rounded-2xl font-black text-slate-400">ATRÁS</button>
+               <button 
+                 onClick={generateScripts} disabled={isGenerating || !project.briefing}
+                 className="flex-[2] bg-emerald-500 text-slate-900 font-black py-6 rounded-2xl shadow-2xl hover:scale-[1.02] transition-all text-xl disabled:opacity-30"
+               >
+                 {isGenerating ? <i className="fas fa-circle-notch animate-spin"></i> : "GENERAR MASTER"}
+               </button>
+             </div>
+          </div>
         )}
 
         {step === 3 && (
-          <div className="space-y-10 animate-in fade-in duration-1000">
-            <div className="flex justify-between items-center px-4">
-              <h2 className="text-5xl font-black italic tracking-tighter uppercase">Guiones</h2>
-              <button onClick={() => setStep(0)} className="bg-white px-8 py-4 rounded-full font-black text-emerald-600 border-2 border-emerald-50 hover:bg-emerald-50 transition-colors">Nuevo</button>
+          <div className="space-y-12 animate-in fade-in duration-700">
+            <div className="flex justify-between items-center">
+              <h2 className="text-4xl font-black italic text-emerald-500">PROYECTOS GENERADOS</h2>
+              <button onClick={() => setStep(0)} className="bg-slate-800 px-6 py-3 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-slate-700">Nuevo Inicio</button>
             </div>
             <div className="grid gap-8">
               {results.map((s, i) => (
-                <div key={i} className="bg-white/70 backdrop-blur-xl p-10 rounded-[3rem] shadow-2xl border border-white flex flex-col md:flex-row gap-10 items-center transition-all hover:scale-[1.01]">
+                <div key={i} className="bg-slate-800/50 p-10 rounded-[2.5rem] border border-slate-700 hover:border-emerald-500/50 transition-all flex flex-col md:flex-row gap-10">
                   <div className="flex-1">
-                    <div className="flex justify-between items-start mb-4">
-                      <h3 className="text-2xl font-black text-slate-800">{s.title}</h3>
-                      <button 
-                        onClick={() => copyToClipboard(s.text, i)}
-                        className={`text-[10px] font-black uppercase tracking-widest ${copiedIndex === i ? 'text-emerald-600' : 'text-slate-400 hover:text-emerald-600'}`}
-                      >
-                        {copiedIndex === i ? "Copiado" : "Copiar Texto"}
-                      </button>
+                    <div className="flex gap-3 mb-4">
+                       <span className="px-3 py-1 bg-emerald-500/10 text-emerald-500 rounded-md text-[8px] font-black uppercase tracking-widest">{s.tone}</span>
+                       <span className="px-3 py-1 bg-slate-700 text-slate-400 rounded-md text-[8px] font-black uppercase tracking-widest">{project.type}</span>
                     </div>
-                    <p className="text-slate-600 text-2xl leading-relaxed italic font-bold">"{s.text}"</p>
-                    <div className="flex gap-4 mt-6">
-                      <span className="px-3 py-1.5 bg-slate-100 rounded-lg text-[8px] font-black text-slate-500 uppercase tracking-widest">{s.tone}</span>
-                      <span className="px-3 py-1.5 bg-blue-50 rounded-lg text-[8px] font-black text-blue-500 uppercase tracking-widest">{s.sfx}</span>
+                    <h3 className="text-2xl font-black mb-4">{s.title}</h3>
+                    <p className="text-slate-400 text-xl font-medium italic leading-relaxed">"{s.text}"</p>
+                    <div className="mt-6 flex items-center gap-4 text-slate-500 text-[10px] font-bold">
+                       <i className="fas fa-wave-square text-emerald-500"></i>
+                       <span>SFX SUGERIDO: {s.sfx}</span>
                     </div>
                   </div>
-                  <div className="w-full md:w-64 flex flex-col gap-4">
+                  <div className="w-full md:w-60 flex flex-col gap-4">
                     <button 
-                      onClick={() => playDemo(i)}
-                      disabled={isGeneratingAudio && playingIndex !== i}
-                      className={`w-full py-7 rounded-[2rem] font-black flex items-center justify-center gap-4 transition-all text-lg shadow-xl ${playingIndex === i ? 'bg-red-500 text-white' : 'bg-slate-900 text-white hover:bg-black'}`}
+                      onClick={() => playStudioProduction(i)}
+                      className={`w-full py-6 rounded-2xl font-black flex flex-col items-center justify-center gap-2 transition-all shadow-xl ${playingIndex === i ? 'bg-red-500 text-white' : 'bg-white text-slate-900 hover:bg-slate-100'}`}
                     >
-                      {isGeneratingAudio && playingIndex === i ? (
-                        <i className="fas fa-circle-notch animate-spin"></i>
+                      {audioStatus && playingIndex === i ? (
+                        <>
+                          <i className="fas fa-spinner animate-spin"></i>
+                          <span className="text-[8px] uppercase">{audioStatus}</span>
+                        </>
                       ) : (
-                        <i className={`fas ${playingIndex === i ? 'fa-stop' : 'fa-play-circle'}`}></i>
+                        <>
+                          <i className={`fas ${playingIndex === i ? 'fa-stop' : 'fa-play'}`}></i>
+                          <span>{playingIndex === i ? 'Detener' : 'Preview Pro'}</span>
+                        </>
                       )}
-                      {playingIndex === i ? 'Detener' : 'Escuchar Spot'}
                     </button>
-                    <button 
-                      onClick={() => playDemo(i, true)}
-                      className="w-full py-7 bg-emerald-600 text-white rounded-[2rem] font-black text-lg shadow-xl hover:brightness-110"
-                    >
-                      <i className="fas fa-download mr-2"></i> Descargar
+                    <button className="w-full py-4 bg-slate-700 text-slate-300 rounded-xl font-black text-xs uppercase hover:bg-slate-600">
+                      Exportar WAV
                     </button>
                   </div>
                 </div>
@@ -487,6 +329,12 @@ const App: React.FC = () => {
           </div>
         )}
       </main>
+
+      {error && (
+        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 bg-red-500 text-white px-8 py-4 rounded-full font-black shadow-2xl animate-bounce">
+          <i className="fas fa-exclamation-triangle mr-2"></i> {error}
+        </div>
+      )}
     </div>
   );
 };
