@@ -1,7 +1,6 @@
-
 {
-  "name": "CREAX RadioAI Argentina",
-  "description": "Publicidad profesional con acento rioplatense y mezcla de audio automática.",
+  "name": "CREAX Pro Studio",
+  "description": "Plataforma de producción audiovisual profesional con Mastering automático e IA.",
   "requestFramePermissions": [
     "microphone"
   ]

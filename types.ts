@@ -1,12 +1,15 @@
 
 export type ProductionType = 'ads' | 'radio_id' | 'podcast' | 'narration';
+export type InterpretationStyle = 'vendedor' | 'amigable' | 'institucional';
 
 export interface AdScript {
+  id: string;
   title: string;
   text: string;
   sfx: string;
   tone: string;
   energy: 'low' | 'mid' | 'high';
+  interpretations: InterpretationStyle[];
 }
 
 export interface AdProject {
