@@ -4,24 +4,37 @@ import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { VIBES, SYSTEM_PROMPT } from './constants';
 import { AdProject, AdScript } from './types';
 
-// Helpers para procesamiento de audio raw de Gemini TTS
+// Utilidad para decodificar base64 manualmente
 function decodeBase64(base64: string) {
-  const binaryString = atob(base64);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
+  try {
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
+  } catch (e) {
+    console.error("Error decodificando Base64:", e);
+    return new Uint8Array(0);
   }
-  return bytes;
 }
 
-async function decodeAudioData(data: Uint8Array, ctx: AudioContext): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
-  const buffer = ctx.createBuffer(1, dataInt16.length, 24000);
-  const channelData = buffer.getChannelData(0);
-  for (let i = 0; i < dataInt16.length; i++) {
-    channelData[i] = dataInt16[i] / 32768.0;
+// Decodificador de PCM raw 16-bit para TTS de Gemini (24000Hz)
+async function decodeRawPcm(data: Uint8Array, ctx: AudioContext): Promise<AudioBuffer | null> {
+  if (!data || data.length === 0) return null;
+  try {
+    const bufferView = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const l = data.byteLength / 2;
+    const audioBuffer = ctx.createBuffer(1, l, 24000);
+    const channelData = audioBuffer.getChannelData(0);
+    for (let i = 0; i < l; i++) {
+      channelData[i] = bufferView.getInt16(i * 2, true) / 32768.0;
+    }
+    return audioBuffer;
+  } catch (e) {
+    console.error("Error al procesar el buffer PCM:", e);
+    return null;
   }
-  return buffer;
 }
 
 const Card: React.FC<{ children: React.ReactNode; className?: string }> = ({ children, className }) => (
@@ -29,6 +42,9 @@ const Card: React.FC<{ children: React.ReactNode; className?: string }> = ({ chi
     {children}
   </div>
 );
+
+// Almacén de música pre-cargada
+const musicCache: Record<string, AudioBuffer | null> = {};
 
 const App: React.FC = () => {
   const [step, setStep] = useState(0);
@@ -39,6 +55,7 @@ const App: React.FC = () => {
   const [playingIndex, setPlayingIndex] = useState<number | null>(null);
   const [isGeneratingAudio, setIsGeneratingAudio] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   
   const [isRecording, setIsRecording] = useState(false);
   const [audioBase64, setAudioBase64] = useState<string | null>(null);
@@ -47,14 +64,14 @@ const App: React.FC = () => {
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const currentSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const recorderRef = useRef<MediaRecorder | null>(null);
 
   const loadingMessages = [
-    "Sintonizando la frecuencia del Litoral...",
-    "Buscando la calidez de nuestras provincias...",
-    "Ajustando el tono federal...",
+    "Sintonizando la frecuencia...",
+    "Buscando la calidez del Litoral...",
+    "Ajustando el tono regional...",
     "Mezclando con sonidos de nuestra tierra...",
-    "Escuchando tu propuesta regional...",
-    "Casi listo, aguardanos un momento..."
+    "Casi listo, aguardanos..."
   ];
 
   useEffect(() => {
@@ -63,11 +80,30 @@ const App: React.FC = () => {
       interval = setInterval(() => {
         setLoadingMessageIndex((prev) => (prev + 1) % loadingMessages.length);
       }, 3000);
-    } else {
-      setLoadingMessageIndex(0);
     }
     return () => clearInterval(interval);
   }, [isGenerating]);
+
+  // Pre-cargar música del ambiente seleccionado
+  useEffect(() => {
+    const preloadMusic = async () => {
+      const vibe = VIBES.find(v => v.id === project.vibe);
+      if (vibe && musicCache[vibe.id] === undefined) {
+        try {
+          if (!audioContextRef.current) audioContextRef.current = new AudioContext();
+          const res = await fetch(vibe.musicUrl);
+          if (!res.ok) throw new Error("Fallo descarga música");
+          const arrayBuf = await res.arrayBuffer();
+          const audioBuf = await audioContextRef.current.decodeAudioData(arrayBuf);
+          musicCache[vibe.id] = audioBuf;
+        } catch (e) { 
+          console.warn("No se pudo pre-cargar música de fondo:", vibe.name);
+          musicCache[vibe.id] = null; 
+        }
+      }
+    };
+    preloadMusic();
+  }, [project.vibe]);
 
   const startRecording = async () => {
     try {
@@ -89,7 +125,7 @@ const App: React.FC = () => {
       mediaRecorder.start();
       setIsRecording(true);
     } catch (err) {
-      setError("No se pudo acceder al micrófono. Por favor permití el acceso.");
+      setError("No se pudo acceder al micrófono. Verificá los permisos.");
     }
   };
 
@@ -101,24 +137,23 @@ const App: React.FC = () => {
   };
 
   const generateScripts = async () => {
-    // IMPORTANTE: El usuario debe renombrar 'Gemini' a 'API_KEY' en Vercel.
     const apiKey = process.env.API_KEY;
     if (!apiKey) {
-      setError("Error de Configuración: En el panel de Vercel, renombrá la variable 'Gemini' a 'API_KEY'.");
+      setError("Error de configuración: API_KEY no encontrada.");
       return;
     }
 
     setIsGenerating(true);
     setError(null);
-    const ai = new GoogleGenAI({ apiKey });
     
-    const finalPrompt = SYSTEM_PROMPT
-      .replace('{category}', project.category)
-      .replace('{location}', project.location)
-      .replace('{briefing}', project.briefing || "Escuchá el audio para la idea.")
-      .replace('{vibe}', project.vibe);
-
     try {
+      const ai = new GoogleGenAI({ apiKey });
+      const finalPrompt = SYSTEM_PROMPT
+        .replace('{category}', project.category)
+        .replace('{location}', project.location)
+        .replace('{briefing}', project.briefing || "Generar propuesta creativa federal.")
+        .replace('{vibe}', project.vibe);
+
       const parts: any[] = [{ text: finalPrompt }];
       if (audioBase64) parts.push({ inlineData: { data: audioBase64, mimeType: 'audio/webm' } });
 
@@ -127,7 +162,6 @@ const App: React.FC = () => {
         contents: { parts },
         config: {
           responseMimeType: "application/json",
-          thinkingConfig: { thinkingBudget: 0 },
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -140,7 +174,8 @@ const App: React.FC = () => {
                     text: { type: Type.STRING },
                     sfx: { type: Type.STRING },
                     tone: { type: Type.STRING }
-                  }
+                  },
+                  required: ["title", "text", "sfx", "tone"]
                 }
               }
             }
@@ -149,10 +184,15 @@ const App: React.FC = () => {
       });
 
       const parsed = JSON.parse(response.text || "{}");
-      setResults(parsed.scripts || []);
-      setStep(3);
+      if (parsed.scripts && parsed.scripts.length > 0) {
+        setResults(parsed.scripts);
+        setStep(3);
+      } else {
+        throw new Error("Respuesta vacía de la IA.");
+      }
     } catch (err) {
-      setError("Error al conectar con el motor creativo. Verificá tu API Key.");
+      console.error(err);
+      setError("La IA está demorando más de lo usual. Intentá con un texto más breve.");
     } finally {
       setIsGenerating(false);
     }
@@ -165,8 +205,8 @@ const App: React.FC = () => {
     setIsGeneratingAudio(false);
   };
 
-  const playDemo = async (index: number) => {
-    if (playingIndex === index) {
+  const playDemo = async (index: number, shouldDownload = false) => {
+    if (playingIndex === index && !shouldDownload) {
       stopAllAudio();
       return;
     }
@@ -183,10 +223,9 @@ const App: React.FC = () => {
       const vibeData = VIBES.find(v => v.id === project.vibe);
       const ai = new GoogleGenAI({ apiKey });
 
-      // 1. Generar Voz con Gemini TTS
       const ttsResponse = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: `Lee este guion de radio con un ${script.tone}: ${script.text}` }] }],
+        contents: [{ parts: [{ text: `Locutor con tono ${script.tone}. Leé este guion de radio: ${script.text}` }] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
@@ -200,46 +239,86 @@ const App: React.FC = () => {
       const ctx = audioContextRef.current;
       if (ctx.state === 'suspended') await ctx.resume();
 
-      // 2. Cargar Música y Voz
-      const [musicRes, voiceData] = await Promise.all([
-        fetch(vibeData?.musicUrl || ''),
-        decodeAudioData(decodeBase64(voiceBase64), ctx)
-      ]);
-      const musicBuffer = await ctx.decodeAudioData(await musicRes.arrayBuffer());
+      // Carga resiliente de música
+      let musicBuffer = musicCache[project.vibe];
+      if (!musicBuffer) {
+        try {
+          const musicRes = await fetch(vibeData?.musicUrl || '');
+          if (musicRes.ok) {
+            musicBuffer = await ctx.decodeAudioData(await musicRes.arrayBuffer());
+            musicCache[project.vibe] = musicBuffer;
+          }
+        } catch (e) {
+          console.warn("Fallo carga música, se usará solo voz.");
+          musicCache[project.vibe] = null;
+        }
+      }
 
-      // 3. Configurar Nodos
+      const voiceBuffer = await decodeRawPcm(decodeBase64(voiceBase64), ctx);
+      if (!voiceBuffer) throw new Error("Error procesando audio de voz.");
+
       const voiceSource = ctx.createBufferSource();
-      voiceSource.buffer = voiceData;
+      voiceSource.buffer = voiceBuffer;
       
-      const musicSource = ctx.createBufferSource();
-      musicSource.buffer = musicBuffer;
-      musicSource.loop = true;
+      const musicSource = musicBuffer ? ctx.createBufferSource() : null;
+      if (musicSource) {
+        musicSource.buffer = musicBuffer!;
+        musicSource.loop = true;
+      }
 
       const musicGain = ctx.createGain();
-      musicGain.gain.setValueAtTime(0.08, ctx.currentTime); // Música bajita para que se entienda la voz
-
       const voiceGain = ctx.createGain();
+      const masterGain = ctx.createGain();
+
+      musicGain.gain.setValueAtTime(0.2, ctx.currentTime);
+      if (musicSource) musicGain.gain.exponentialRampToValueAtTime(0.06, ctx.currentTime + 1.2);
       voiceGain.gain.setValueAtTime(1.0, ctx.currentTime);
 
-      voiceSource.connect(voiceGain).connect(ctx.destination);
-      musicSource.connect(musicGain).connect(ctx.destination);
+      if (shouldDownload) {
+        const dest = ctx.createMediaStreamDestination();
+        masterGain.connect(dest);
+        const mediaRecorder = new MediaRecorder(dest.stream);
+        const chunks: Blob[] = [];
+        mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+        mediaRecorder.onstop = () => {
+          const blob = new Blob(chunks, { type: 'audio/webm' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `SPOT-RADIO-${script.title.replace(/\s+/g, '-')}.webm`;
+          a.click();
+        };
+        mediaRecorder.start();
+        recorderRef.current = mediaRecorder;
+      }
+
+      voiceSource.connect(voiceGain).connect(masterGain).connect(ctx.destination);
+      if (musicSource) musicSource.connect(musicGain).connect(masterGain).connect(ctx.destination);
 
       setIsGeneratingAudio(false);
       voiceSource.start();
-      musicSource.start();
-
-      currentSourcesRef.current = [voiceSource, musicSource];
+      if (musicSource) musicSource.start();
+      currentSourcesRef.current = musicSource ? [voiceSource, musicSource] : [voiceSource];
       
       voiceSource.onended = () => {
-        musicGain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 2);
-        setTimeout(stopAllAudio, 2000);
+        if (musicSource) musicGain.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 1);
+        setTimeout(() => {
+          if (recorderRef.current && recorderRef.current.state === 'recording') recorderRef.current.stop();
+          stopAllAudio();
+        }, 2000);
       };
 
     } catch (e) {
       console.error(e);
-      setError("Error al generar la maqueta de audio.");
+      setError("Error al procesar el audio. Intentá reproducir de nuevo.");
       stopAllAudio();
     }
+  };
+
+  const copyToClipboard = (text: string, index: number) => {
+    navigator.clipboard.writeText(text);
+    setCopiedIndex(index);
+    setTimeout(() => setCopiedIndex(null), 2000);
   };
 
   return (
@@ -251,23 +330,23 @@ const App: React.FC = () => {
           </div>
           <h1 className="text-3xl font-black italic tracking-tighter uppercase">CREAX <span className="text-emerald-600">IA</span></h1>
         </div>
-        <div className="hidden md:flex items-center gap-2 bg-white px-5 py-2.5 rounded-full text-[10px] font-black uppercase border border-slate-200 shadow-sm text-slate-400">
+        <div className="flex items-center gap-2 bg-white px-5 py-2.5 rounded-full text-[10px] font-black uppercase border border-slate-200 shadow-sm text-slate-400">
           <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
-          Estudio Federal v3.8
+          Estudio Federal v4.1
         </div>
       </nav>
 
       <main className="max-w-4xl mx-auto px-6 py-10">
         {error && (
-          <Card className="mb-8 !p-8 border-red-100 bg-red-50/50">
+          <Card className="mb-8 !p-8 border-red-100 bg-red-50/50 animate-in slide-in-from-top-4">
             <div className="flex items-center gap-4 text-red-700">
               <i className="fas fa-circle-exclamation text-3xl"></i>
-              <div>
-                <p className="font-black text-xl leading-tight">Acción Requerida</p>
+              <div className="flex-1">
+                <p className="font-black text-xl leading-tight">Estado del Sistema</p>
                 <p className="font-medium opacity-80 text-sm mt-1">{error}</p>
               </div>
+              <button onClick={() => setError(null)} className="text-red-400 hover:text-red-600"><i className="fas fa-times"></i></button>
             </div>
-            <button onClick={() => setError(null)} className="mt-4 text-red-600 font-black text-xs uppercase tracking-widest border-b-2 border-red-200 pb-1">Entendido</button>
           </Card>
         )}
 
@@ -275,23 +354,23 @@ const App: React.FC = () => {
           <Card className="animate-in fade-in slide-in-from-bottom-10 duration-1000">
             <div className="mb-12 text-center">
               <h2 className="text-6xl font-black mb-6 leading-[1.1] tracking-tight">Publicidad <br/><span className="text-emerald-600">Federal y Nuestra</span></h2>
-              <p className="text-slate-400 font-medium text-xl">Creatividad del NEA impulsada por IA multimodal.</p>
+              <p className="text-slate-400 font-medium text-xl">Potenciá tu marca con el tono del Litoral.</p>
             </div>
             <div className="grid md:grid-cols-2 gap-8 mb-8">
               <input 
-                type="text" placeholder="Ej: Supermercado El Litoral..."
+                type="text" placeholder="¿Qué vendemos?"
                 className="w-full p-6 bg-slate-50 border-2 border-transparent focus:border-emerald-600 focus:bg-white rounded-3xl outline-none transition-all text-lg font-bold shadow-sm"
                 value={project.category} onChange={e => setProject({...project, category: e.target.value})}
               />
               <input 
-                type="text" placeholder="Ej: Posadas, Misiones..."
+                type="text" placeholder="¿En qué ciudad?"
                 className="w-full p-6 bg-slate-50 border-2 border-transparent focus:border-emerald-600 focus:bg-white rounded-3xl outline-none transition-all text-lg font-bold shadow-sm"
                 value={project.location} onChange={e => setProject({...project, location: e.target.value})}
               />
             </div>
             <button 
               onClick={() => setStep(1)} disabled={!project.category || !project.location}
-              className="w-full bg-emerald-600 text-white font-black py-8 rounded-[2.5rem] shadow-[0_25px_50px_-12px_rgba(5,150,105,0.4)] hover:shadow-emerald-500/50 hover:-translate-y-1 transition-all text-2xl disabled:opacity-50"
+              className="w-full bg-emerald-600 text-white font-black py-8 rounded-[2.5rem] shadow-xl hover:-translate-y-1 transition-all text-2xl disabled:opacity-50"
             >
               Configurar Estilo <i className="fas fa-arrow-right ml-2 text-sm"></i>
             </button>
@@ -326,7 +405,7 @@ const App: React.FC = () => {
             <h2 className="text-4xl font-black mb-8 text-center">Contanos tu <span className="text-emerald-600">Propuesta</span></h2>
             <div className="grid md:grid-cols-2 gap-8 mb-10">
               <textarea 
-                rows={6} placeholder="Escribí tu idea..."
+                rows={6} placeholder="Detalles de la oferta o promo..."
                 className="w-full p-8 bg-slate-100/50 border-4 border-transparent focus:border-emerald-600 focus:bg-white rounded-[2.5rem] outline-none transition-all text-xl font-bold shadow-inner"
                 value={project.briefing} onChange={e => setProject({...project, briefing: e.target.value})}
               />
@@ -334,23 +413,23 @@ const App: React.FC = () => {
                 {audioBase64 ? (
                   <div className="text-center animate-in zoom-in-50">
                     <div className="w-20 h-20 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center text-3xl mx-auto mb-4"><i className="fas fa-check"></i></div>
-                    <span className="font-black text-emerald-800 text-[10px] uppercase">Audio listo</span>
-                    <button onClick={() => setAudioBase64(null)} className="block mt-2 text-red-500 font-black text-[10px] uppercase">Borrar</button>
+                    <span className="font-black text-emerald-800 text-[10px] uppercase tracking-widest">Audio cargado</span>
+                    <button onClick={() => setAudioBase64(null)} className="block mt-2 text-red-500 font-black text-[10px] uppercase">Eliminar</button>
                   </div>
                 ) : (
                   <button 
                     onClick={isRecording ? stopRecording : startRecording}
-                    className={`w-28 h-28 rounded-full flex items-center justify-center text-4xl shadow-2xl transition-all ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-emerald-600 text-white'}`}
+                    className={`w-28 h-28 rounded-full flex items-center justify-center text-4xl shadow-2xl transition-all ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'bg-emerald-600 text-white hover:scale-110'}`}
                   >
                     <i className={`fas ${isRecording ? 'fa-stop' : 'fa-microphone'}`}></i>
                   </button>
                 )}
-                {!audioBase64 && !isRecording && <span className="mt-4 font-black text-slate-400 text-[10px] uppercase">Hablá ahora</span>}
+                {!audioBase64 && !isRecording && <span className="mt-4 font-black text-slate-400 text-[10px] uppercase tracking-widest">Grabar Idea</span>}
               </div>
             </div>
             <button 
               onClick={generateScripts} disabled={isGenerating || (!project.briefing && !audioBase64)}
-              className={`w-full text-white font-black py-9 rounded-[3rem] text-3xl flex items-center justify-center gap-6 shadow-2xl transition-all ${isGenerating ? 'bg-slate-800' : 'bg-gradient-to-r from-emerald-600 to-blue-700'}`}
+              className={`w-full text-white font-black py-9 rounded-[3rem] text-3xl flex items-center justify-center gap-6 shadow-2xl transition-all ${isGenerating ? 'bg-slate-800' : 'bg-gradient-to-r from-emerald-600 to-blue-700 hover:brightness-110'}`}
             >
               {isGenerating ? <span>{loadingMessages[loadingMessageIndex]}</span> : "Generar Campaña"}
             </button>
@@ -360,17 +439,26 @@ const App: React.FC = () => {
         {step === 3 && (
           <div className="space-y-10 animate-in fade-in duration-1000">
             <div className="flex justify-between items-center px-4">
-              <h2 className="text-5xl font-black italic tracking-tighter uppercase">Guiones <span className="text-emerald-600">NEA</span></h2>
-              <button onClick={() => setStep(0)} className="bg-white px-8 py-4 rounded-full font-black text-emerald-600 border-2 border-emerald-50">Nuevo</button>
+              <h2 className="text-5xl font-black italic tracking-tighter uppercase">Guiones</h2>
+              <button onClick={() => setStep(0)} className="bg-white px-8 py-4 rounded-full font-black text-emerald-600 border-2 border-emerald-50 hover:bg-emerald-50 transition-colors">Nuevo</button>
             </div>
             <div className="grid gap-8">
               {results.map((s, i) => (
-                <div key={i} className="bg-white/70 backdrop-blur-xl p-10 rounded-[3rem] shadow-2xl border border-white flex flex-col md:flex-row gap-10 items-center">
+                <div key={i} className="bg-white/70 backdrop-blur-xl p-10 rounded-[3rem] shadow-2xl border border-white flex flex-col md:flex-row gap-10 items-center transition-all hover:scale-[1.01]">
                   <div className="flex-1">
-                    <h3 className="text-2xl font-black text-slate-800 mb-4">{s.title}</h3>
+                    <div className="flex justify-between items-start mb-4">
+                      <h3 className="text-2xl font-black text-slate-800">{s.title}</h3>
+                      <button 
+                        onClick={() => copyToClipboard(s.text, i)}
+                        className={`text-[10px] font-black uppercase tracking-widest ${copiedIndex === i ? 'text-emerald-600' : 'text-slate-400 hover:text-emerald-600'}`}
+                      >
+                        {copiedIndex === i ? "Copiado" : "Copiar Texto"}
+                      </button>
+                    </div>
                     <p className="text-slate-600 text-2xl leading-relaxed italic font-bold">"{s.text}"</p>
                     <div className="flex gap-4 mt-6">
-                      <span className="px-4 py-2 bg-slate-100 rounded-xl text-[9px] font-black text-slate-500 uppercase italic tracking-widest">{s.tone}</span>
+                      <span className="px-3 py-1.5 bg-slate-100 rounded-lg text-[8px] font-black text-slate-500 uppercase tracking-widest">{s.tone}</span>
+                      <span className="px-3 py-1.5 bg-blue-50 rounded-lg text-[8px] font-black text-blue-500 uppercase tracking-widest">{s.sfx}</span>
                     </div>
                   </div>
                   <div className="w-full md:w-64 flex flex-col gap-4">
@@ -384,9 +472,12 @@ const App: React.FC = () => {
                       ) : (
                         <i className={`fas ${playingIndex === i ? 'fa-stop' : 'fa-play-circle'}`}></i>
                       )}
-                      {playingIndex === i ? 'Parar' : 'Escuchar Locutor'}
+                      {playingIndex === i ? 'Detener' : 'Escuchar Spot'}
                     </button>
-                    <button className="w-full py-7 bg-emerald-600 text-white rounded-[2rem] font-black text-lg shadow-xl hover:scale-105 transition-transform">
+                    <button 
+                      onClick={() => playDemo(i, true)}
+                      className="w-full py-7 bg-emerald-600 text-white rounded-[2rem] font-black text-lg shadow-xl hover:brightness-110"
+                    >
                       <i className="fas fa-download mr-2"></i> Descargar
                     </button>
                   </div>
